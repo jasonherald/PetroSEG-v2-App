@@ -8,7 +8,7 @@ dask==2024.8.0
 matplotlib==3.9.2
 watchdog==4.0.1
 streamlit-desktop-app
-torch==2.4.0
+torch==2.8.0
 langchain==0.2.10
 tensorflow-macos==2.16.2
 tensorflow-metal==1.2.0
