@@ -9,7 +9,7 @@ matplotlib==3.9.2
 watchdog==4.0.1
 streamlit-desktop-app
 torch==2.4.0
-langchain==0.2.10
+langchain==0.3.27
 tensorflow-macos==2.16.2
 tensorflow-metal==1.2.0
 tensorboard==2.20.0
