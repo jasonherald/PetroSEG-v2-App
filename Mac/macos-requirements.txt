@@ -6,7 +6,7 @@ scikit-image==0.24.0
 scikit-learn==1.5.1
 dask==2024.8.0
 matplotlib==3.9.2
-watchdog==4.0.1
+watchdog==6.0.0
 streamlit-desktop-app
 torch==2.4.0
 langchain==0.3.27
