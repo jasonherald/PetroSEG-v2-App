@@ -5,7 +5,7 @@ Pillow==11.3.0
 scikit-image==0.24.0
 scikit-learn==1.5.1
 dask==2024.8.0
-matplotlib==3.9.2
+matplotlib==3.9.4
 watchdog==6.0.0
 streamlit-desktop-app
 torch==2.4.0
