@@ -5,7 +5,8 @@ if [[ -f .env ]]; then
   export $(grep -v '^#' .env | xargs)
 fi
 
-rm -rf ./dist && rm -rf ./build
+rm -rf ./build
+rm -rf ./dist
 
 set -e                               # abort on first error
 

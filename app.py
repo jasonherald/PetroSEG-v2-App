@@ -2,25 +2,20 @@ import streamlit as st
 import cv2
 import numpy as np
 import os
-import numpy as np
-import streamlit as st
-import os
 from skimage import segmentation
 from skimage.color import color_dict, label2rgb
 import tensorflow as tf
 from keras import layers, models, optimizers, losses
 from sklearn.cluster import KMeans
 
+import subprocess
+from pathlib import Path
+
 import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from skimage.segmentation import find_boundaries
-import cv2
-import tempfile
-from io import BytesIO
-import streamlit as st
-import numpy as np
 
 
 def resize_image(image, target_size):
@@ -57,23 +52,89 @@ def automatically_change_segment_colors(segmented_image):
     return segmented_image
 
 def download_image(image_array, file_name):
+    """Use macOS 'choose file name' to get a save path and write the image there (no Streamlit modal).
+    Falls back to ~/Downloads/PetroSeg if AppleScript is unavailable/blocked."""
     try:
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
-        success = cv2.imwrite(temp_file.name, image_array)
+        # --- Normalize image dtype to uint8 ---
+        img = image_array
+        if img.dtype != np.uint8:
+            maxv = float(img.max()) if img.size else 1.0
+            if maxv <= 1.0:
+                img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+
+        # --- Ensure channel order for OpenCV writers ---
+        if img.ndim == 3:
+            if img.shape[2] == 3:
+                # RGB -> BGR
+                img_to_write = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            elif img.shape[2] == 4:
+                # RGBA -> BGRA (preserve alpha if saving PNG/TIFF)
+                img_to_write = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA)
+            else:
+                img_to_write = img
+        else:
+            # Grayscale 2D
+            img_to_write = img
+
+        # --- Ask for save path using macOS AppleScript ---
+        safe_default = file_name.replace('"', '\\"')  # escape quotes for AppleScript string
+        script_lines = [
+            f'set defaultName to "{safe_default}"',
+            'set fp to POSIX path of (choose file name with prompt "Save segmented image as…" default name defaultName)',
+            'return fp'
+        ]
+
+        save_path = None
+        try:
+            proc = subprocess.run([
+                "osascript", "-e", script_lines[0], "-e", script_lines[1], "-e", script_lines[2]
+            ], capture_output=True, text=True)
+            if proc.returncode == 0:
+                out = proc.stdout.strip()
+                if out:
+                    save_path = out
+        except FileNotFoundError:
+            # osascript not present (very rare on macOS), fall through to fallback
+            pass
+
+        if not save_path:
+            # --- Hardened runtime / automation disabled / user canceled -> fallback path ---
+            # If user canceled (non-zero return with some output), just notify and return.
+            if proc.returncode != 0 if 'proc' in locals() else False:
+                st.info('Save canceled.')
+                return
+
+            fallback_dir = Path.home() / 'Downloads' / 'PetroSeg'
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            # Ensure extension
+            base = Path(file_name)
+            # Always use .png extension for fallback
+            base = base.with_suffix('.png')
+            # Avoid collisions
+            candidate = fallback_dir / base.name
+            idx = 1
+            while candidate.exists():
+                stem = base.stem
+                suffix = base.suffix
+                candidate = fallback_dir / f"{stem}_{idx}{suffix}"
+                idx += 1
+            save_path = str(candidate)
+
+        # Always save as .png regardless of what the user selected
+        p = Path(save_path).with_suffix('.png')
+
+        # --- Write always as PNG ---
+        success = cv2.imwrite(str(p), img_to_write)
         if not success:
-            st.error("Could not save image.")
+            st.error('Could not save image.')
             return
-        with open(temp_file.name, 'rb') as f:
-            bytes = f.read()
-        st.download_button(
-            label="Download Image",
-            data=BytesIO(bytes),
-            file_name=file_name,
-            mime='image/png',
-        )
+
+        # --- Notify ---
+        st.success(f'Saved image to: {str(p)}')
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f'An error occurred while saving: {e}')
 
 def perform_custom_segmentation(image, params):
     class Args(object):
@@ -349,7 +410,8 @@ def main() -> None:
             handle_color_picking()
             display_segmentation_results()
             calculate_and_display_label_percentages()
-            download_image(st.session_state.segmented_image, 'segmented_image.png')
+            if st.sidebar.button('Save Image…'):
+                download_image(st.session_state.segmented_image, 'segmented_image.png')
 
 def initialize_session_state():
     st.session_state.setdefault('segmented_image', None)
