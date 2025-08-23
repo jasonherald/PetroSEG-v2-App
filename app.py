@@ -222,6 +222,9 @@ def perform_custom_segmentation(image, params):
         seg_map = seg_map.flatten()
         seg_lab = [np.where(seg_map == u_label)[0]
                 for u_label in np.unique(seg_map)]
+        # Create dense segment id map for vectorized majority vote
+        unique_segments, segment_ids = np.unique(seg_map, return_inverse=True)
+        num_segments = unique_segments.size
 
         # Convert segmentation map to RGB image with boundaries
         segmented_image = label2rgb(seg_map.reshape(image.shape[:2]), image, kind='avg')
@@ -235,6 +238,9 @@ def perform_custom_segmentation(image, params):
         kmeans = KMeans(n_clusters=args.max_label_num, random_state=0).fit(image_flatten)
         seg_map = kmeans.labels_
         seg_lab = [np.where(seg_map == u_label)[0] for u_label in np.unique(seg_map)]
+        # Create dense segment id map for vectorized majority vote
+        unique_segments, segment_ids = np.unique(seg_map, return_inverse=True)
+        num_segments = unique_segments.size
 
     # Set device to GPU if available, otherwise CPU
     device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
@@ -260,6 +266,8 @@ def perform_custom_segmentation(image, params):
 
         progress_bar = st.progress(0)
         image_placeholder = st.empty()
+        # Allocate reusable counts buffer for per-segment label histogram
+        counts = np.zeros((num_segments, args.mod_dim2), dtype=np.int32)
 
         for batch_idx in range(args.train_epoch):
             with tf.GradientTape() as tape:
@@ -268,10 +276,11 @@ def perform_custom_segmentation(image, params):
                 target = tf.argmax(output, axis=1)
                 im_target = target.numpy()
 
-                # Update target labels based on segmentation
-                for inds in seg_lab:
-                    u_labels, hist = np.unique(im_target[inds], return_counts=True)
-                    im_target[inds] = u_labels[np.argmax(hist)]
+                # Update target labels based on segmentation (vectorized majority vote)
+                counts.fill(0)
+                np.add.at(counts, (segment_ids, im_target), 1)
+                majority = counts.argmax(axis=1).astype(im_target.dtype)
+                im_target = majority[segment_ids]
 
                 label_maps.append(im_target.reshape(h, w))
 
