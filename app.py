@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import os
 from skimage import segmentation
-from skimage.color import color_dict, label2rgb
+from skimage.color import label2rgb
 import tensorflow as tf
 from keras import layers, models, optimizers, losses
 from sklearn.cluster import KMeans
@@ -40,16 +40,12 @@ def resize_image(image, target_size):
     return resized_image
 
 def automatically_change_segment_colors(segmented_image):
-    # Generate a unique color for each segment
-    unique_labels = np.unique(segmented_image.reshape(-1, 3), axis=0)
-    new_colors = np.random.randint(0, 256, (len(unique_labels), 3), dtype=np.uint8)
-    
-    # Apply the new colors to the segmented image
-    for i, label in enumerate(unique_labels):
-        mask = np.all(segmented_image == label, axis=-1)
-        segmented_image[mask] = new_colors[i]
-    
-    return segmented_image
+    """Vectorized recoloring: assign a random color to each unique RGB triplet."""
+    view = segmented_image.reshape(-1, 3)
+    uniq, inv = np.unique(view, axis=0, return_inverse=True)
+    new_colors = np.random.randint(0, 256, size=uniq.shape, dtype=np.uint8)
+    remapped = new_colors[inv].reshape(segmented_image.shape)
+    return remapped
 
 def download_image(image_array, file_name):
     """Use macOS 'choose file name' to get a save path and write the image there (no Streamlit modal).
@@ -136,6 +132,21 @@ def download_image(image_array, file_name):
     except Exception as e:
         st.error(f'An error occurred while saving: {e}')
 
+ # --- Vectorized helpers ---
+def _vectorized_mean_colors(lab_inverse: np.ndarray, image_flatten: np.ndarray, k: int) -> np.ndarray:
+    """Compute per-cluster mean RGB colors using vectorized bincounts.
+    Returns uint8 array of shape (k, 3).
+    """
+    # counts per label (avoid divide-by-zero by replacing zeros with 1)
+    counts = np.bincount(lab_inverse, minlength=k).astype(np.float32)
+    counts[counts == 0] = 1.0
+    # sums for each channel
+    sums_r = np.bincount(lab_inverse, weights=image_flatten[:, 0], minlength=k)
+    sums_g = np.bincount(lab_inverse, weights=image_flatten[:, 1], minlength=k)
+    sums_b = np.bincount(lab_inverse, weights=image_flatten[:, 2], minlength=k)
+    color_avg = np.stack([sums_r, sums_g, sums_b], axis=1) / counts[:, None]
+    return np.clip(color_avg, 0, 255).astype(np.uint8)
+
 def perform_custom_segmentation(image, params):
     class Args(object):
         def __init__(self, params):
@@ -192,9 +203,17 @@ def perform_custom_segmentation(image, params):
         model = models.Model(inputs=inputs, outputs=x)
         return model
 
+
     np.random.seed(1943)
     tf.random.set_seed(1943)
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
+
+    # Precompute shapes and flattened image as float32 for bincount-based means
+    h, w = image.shape[:2]
+    image_flatten = image.reshape((-1, 3)).astype(np.float32)
+
+    # Store per-epoch label maps so that downstream stats use exact labels
+    label_maps: list[np.ndarray] = []
 
     '''segmentation ML'''
     if args.segmentation_method == 'felzenszwalb':
@@ -213,7 +232,6 @@ def perform_custom_segmentation(image, params):
         
     elif args.segmentation_method == 'kmeans':
         # Perform KMeans clustering
-        image_flatten = image.reshape((-1, 3))
         kmeans = KMeans(n_clusters=args.max_label_num, random_state=0).fit(image_flatten)
         seg_map = kmeans.labels_
         seg_lab = [np.where(seg_map == u_label)[0] for u_label in np.unique(seg_map)]
@@ -231,7 +249,12 @@ def perform_custom_segmentation(image, params):
         criterion = losses.SparseCategoricalCrossentropy(from_logits=True)
         optimizer = optimizers.SGD(learning_rate=5e-2, momentum=0.9)
 
-        image_flatten = image.reshape((-1, 3))
+        # Compiled forward pass without XLA (jit_compile) to avoid platform issues on some mac builds
+        def forward(t: tf.Tensor):
+            x = model(t, training=True)[0]
+            return tf.reshape(x, (-1, args.mod_dim2))
+        forward = tf.function(forward, reduce_retracing=True)
+
         color_avg = np.random.randint(255, size=(args.max_label_num, 3))
         show = image
 
@@ -241,8 +264,7 @@ def perform_custom_segmentation(image, params):
         for batch_idx in range(args.train_epoch):
             with tf.GradientTape() as tape:
                 # Forward pass
-                output = model(tensor, training=True)[0]
-                output = tf.reshape(output, (-1, args.mod_dim2))
+                output = forward(tf.convert_to_tensor(tensor))
                 target = tf.argmax(output, axis=1)
                 im_target = target.numpy()
 
@@ -251,22 +273,25 @@ def perform_custom_segmentation(image, params):
                     u_labels, hist = np.unique(im_target[inds], return_counts=True)
                     im_target[inds] = u_labels[np.argmax(hist)]
 
-                target = tf.convert_to_tensor(im_target)
+                label_maps.append(im_target.reshape(h, w))
+
+                target = tf.cast(tf.convert_to_tensor(im_target), tf.int32)
                 loss = criterion(target, output)
 
             # Backward pass and optimization
             grads = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables)) # type: ignore
 
-            # Update segmented image
+            # Update segmented image (vectorized color assignment)
             un_label, lab_inverse = np.unique(im_target, return_inverse=True)
-            if un_label.shape[0] < args.max_label_num:
-                img_flatten = image_flatten.copy()
-                if len(color_avg) != un_label.shape[0]:
-                    color_avg = [np.mean(img_flatten[im_target == label], axis=0, dtype=int) for label in un_label]
-                for lab_id, color in enumerate(color_avg):
-                    img_flatten[lab_inverse == lab_id] = color
-                show = img_flatten.reshape(image.shape)
+            K = un_label.shape[0]
+            if K < args.max_label_num:
+                # Compute/refresh mean colors per label using bincounts (fast & deterministic)
+                color_avg = _vectorized_mean_colors(lab_inverse, image_flatten, K)
+                # Map each pixel to its cluster mean color without per-label loops
+                show = color_avg[lab_inverse].reshape(h, w, 3)
+            else:
+                show = image  # fallback, though unlikely with typical settings
 
             segmented_images.append(show.copy())
 
@@ -274,6 +299,9 @@ def perform_custom_segmentation(image, params):
             progress = (batch_idx + 1) / args.train_epoch
             progress_bar.progress(progress)
             image_placeholder.image(show, caption=f'Epoch {batch_idx + 1}', use_container_width=True)
+
+    # Expose exact per-epoch label maps for downstream percentage calculations
+    st.session_state["segmented_label_maps"] = label_maps
 
     return segmented_images
 
@@ -302,18 +330,22 @@ def display_segmentation_results() -> None:
     st.image(st.session_state.segmented_image, caption='Updated Segmented Image', use_container_width=True)
 
 def randomize_colors() -> None:
-    """Randomize colors for segmentation labels"""
-    unique_labels = np.unique(st.session_state.segmented_image.reshape(-1, 3), axis=0)
-    random_colors = {tuple(label): tuple(np.random.randint(0, 256, size=3)) for label in unique_labels}
+    """Randomize colors for segmentation labels using a vectorized LUT remap."""
+    img = st.session_state.segmented_image
+    # Build a view that makes each RGB triplet a single item for uniqueness
+    view = img.reshape(-1, 3)
+    uniq, inv = np.unique(view, axis=0, return_inverse=True)
+    new_colors = np.random.randint(0, 256, size=uniq.shape, dtype=np.uint8)
+    remapped = new_colors[inv].reshape(img.shape)
+    st.session_state.segmented_image = remapped
 
-    for old_color, new_color in random_colors.items():
-        mask = np.all(st.session_state.segmented_image == np.array(old_color), axis=-1)
-        st.session_state.segmented_image[mask] = new_color
-
-    st.session_state.new_colors.update(random_colors)
-    st.session_state.image_update_trigger += 1  # Trigger image update
+    # Track mapping for color picker compatibility
+    st.session_state.new_colors.update({tuple(old): tuple(new) for old, new in zip(map(tuple, uniq), map(tuple, new_colors))})
+    st.session_state.image_update_trigger += 1
 
 def handle_color_picking() -> None:
+    if st.session_state.segmented_image is None:
+        return
     """Handle color picking and other functionalities"""
     unique_labels = np.unique(st.session_state.segmented_image.reshape(-1, 3), axis=0)
     for i, label in enumerate(unique_labels):
@@ -333,7 +365,40 @@ def handle_color_picking() -> None:
     st.session_state.image_update_trigger += 1
 
 def calculate_and_display_label_percentages() -> None:
-    """Calculate and display label percentages"""
+    """Calculate and display label percentages based on the exact label map for the selected epoch.
+    Falls back to RGB-based approximation only if label map is unavailable.
+    """
+    label_map = st.session_state.get("current_label_map")
+    seg_img = st.session_state.get("segmented_image")
+
+    if label_map is not None and seg_img is not None:
+        # Exact counts from integer label map
+        unique_labels, counts = np.unique(label_map, return_counts=True)
+        total_pixels = int(counts.sum()) if counts.size else 1
+        label_percentages = {int(lbl): (float(cnt) / float(total_pixels)) * 100.0 for lbl, cnt in zip(unique_labels, counts)}
+        # Vectorized: take first occurrence of each label in flattened arrays
+        labels_flat = label_map.ravel()
+        seg_flat = seg_img.reshape(-1, seg_img.shape[-1])
+        _, first_idx = np.unique(labels_flat, return_index=True)
+        # Build color mapping
+        label_to_color = {}
+        for lbl, idx in zip(np.unique(labels_flat), first_idx):
+            color = seg_flat[idx]
+            hex_color = f'#{int(color[0]):02x}{int(color[1]):02x}{int(color[2]):02x}'
+            label_to_color[int(lbl)] = hex_color
+
+        st.write("Label Percentages:")
+        for lbl in unique_labels:
+            hex_color = label_to_color[int(lbl)]
+            pct = label_percentages[int(lbl)]
+            color_box = (
+                f'<div style="display:inline-block;width:20px;height:20px;'
+                f'background-color:{hex_color};margin-right:10px;"></div>'
+            )
+            st.markdown(f'{color_box} Label {int(lbl)}: {pct:.2f}%', unsafe_allow_html=True)
+        return
+
+    # Fallback (approximate) — use grayscale buckets only if label map is missing
     final_labels = cv2.cvtColor(st.session_state.segmented_image, cv2.COLOR_BGR2GRAY)
     unique_labels, counts = np.unique(final_labels, return_counts=True)
     total_pixels = np.sum(counts)
@@ -407,6 +472,10 @@ def main() -> None:
         if st.session_state.segmented_images:
             epoch = st.sidebar.slider("Select Epoch", 1, len(st.session_state.segmented_images), len(st.session_state.segmented_images))
             st.session_state.segmented_image = st.session_state.segmented_images[epoch - 1]
+            # Keep the exact integer label map aligned with the selected epoch (for accurate stats)
+            seg_label_maps = st.session_state.get("segmented_label_maps")
+            if isinstance(seg_label_maps, list) and len(seg_label_maps) >= epoch:
+                st.session_state["current_label_map"] = seg_label_maps[epoch - 1]
             handle_color_picking()
             display_segmentation_results()
             calculate_and_display_label_percentages()
