@@ -2,6 +2,7 @@
 Forked from: https://github.com/fazzam12345/PetroSEG-v2
 
 ------------
+**Note - As of v0.1.2 there are deviations from the original codebase to increase performance, update dependencies and contribute positively to accuracy wherever possible.
 
 ## Table of Contents
 1. Introduction
