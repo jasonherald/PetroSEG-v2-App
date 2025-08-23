@@ -6,6 +6,7 @@ from skimage import segmentation
 from skimage.color import label2rgb
 import tensorflow as tf
 from keras import layers, models, optimizers, losses
+from tensorflow.keras.layers import Dense  # type: ignore
 from sklearn.cluster import KMeans
 
 import subprocess
@@ -235,7 +236,11 @@ def perform_custom_segmentation(image, params):
         
     elif args.segmentation_method == 'kmeans':
         # Perform KMeans clustering
-        kmeans = KMeans(n_clusters=args.max_label_num, random_state=0).fit(image_flatten)
+        kmeans = KMeans(
+            n_clusters=args.max_label_num,
+            n_init=10,              # preserve pre-1.4/1.5 behavior; deterministic across 1.6.1
+            random_state=0
+        ).fit(image_flatten)
         seg_map = kmeans.labels_
         seg_lab = [np.where(seg_map == u_label)[0] for u_label in np.unique(seg_map)]
         # Create dense segment id map for vectorized majority vote
@@ -278,7 +283,14 @@ def perform_custom_segmentation(image, params):
 
                 # Update target labels based on segmentation (vectorized majority vote)
                 counts.fill(0)
-                np.add.at(counts, (segment_ids, im_target), 1)
+                np.add.at(
+                    counts,
+                    (
+                        segment_ids.astype(np.intp, copy=False),
+                        im_target.astype(np.intp,   copy=False)
+                    ),
+                    1
+                )
                 majority = counts.argmax(axis=1).astype(im_target.dtype)
                 im_target = majority[segment_ids]
 
