@@ -9,5 +9,5 @@ matplotlib==3.9.4
 watchdog==6.0.0
 streamlit-desktop-app
 langchain==0.3.27
-tensorflow==2.19.0
+tensorflow==2.20.0
 tensorflow-metal==1.2.0
